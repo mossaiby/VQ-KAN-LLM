@@ -68,9 +68,11 @@ Vector Quantization & Projection Head
 4. **Aligned Loss Function & Cosine Classification Head**
    - The total objective combines cross-entropy in cosine-logit space with a latent commitment penalty:
 
-     $$
-     \mathcal{L} = \operatorname{CrossEntropy}\!\left(16.0\,\frac{z}{\lVert z \rVert_2}\left(\frac{E}{\lVert E \rVert_2}\right)^T, y\right) + \mathcal{L}_{\mathrm{VQ}}
-     $$
+   $$
+   \mathcal{L} = \operatorname{CE}\!\left(16 \, \hat{z} \hat{E}^{\mathsf{T}}, y\right) + \mathcal{L}_{\mathrm{VQ}}
+   $$
+
+   where \(\hat{z} = z / \lVert z \rVert_2\) and each row of \(\hat{E}\) is an L2-normalized codebook vector.
 
    - Training and generation use the same logit space, preventing alignment drift between optimization and sampling.
 
