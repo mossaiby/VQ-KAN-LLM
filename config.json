@@ -1,0 +1,37 @@
+{
+  "model": {
+    "vocab_size": 2048,
+    "embed_dim": 256,
+    "num_layers": 4,
+    "nhead": 8,
+    "max_seq_len": 128,
+    "dropout": 0.1,
+    "grid_size": 5,
+    "commitment_cost": 0.05
+  },
+  "data": {
+    "dataset_name": "roneneldan/TinyStories",
+    "dataset_split": "train[:25%]",
+    "local_data_file": null
+  },
+  "training": {
+    "batch_size": 32,
+    "max_steps": 10000,
+    "warmup_steps": 500,
+    "max_lr": 4e-4,
+    "min_lr": 4e-5,
+    "weight_decay": 0.01,
+    "grad_clip": 1.0,
+    "log_interval": 50
+  },
+  "inference": {
+    "max_new_tokens": 80,
+    "temperature": 0.7,
+    "top_k": 30,
+    "top_p": 0.9,
+    "repetition_penalty": 1.25
+  },
+  "paths": {
+    "checkpoint_dir": "./kan_vq_scaled_checkpoints"
+  }
+}

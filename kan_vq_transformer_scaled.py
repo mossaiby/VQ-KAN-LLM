@@ -1,6 +1,8 @@
 import os
+import json
 import random
 import math
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -51,11 +53,11 @@ class ReLUKANLinear(nn.Module):
 # 2. Transformer MLP Block using ReLU-KAN
 # ==========================================
 class ReLUKANMLP(nn.Module):
-    def __init__(self, d_model, dim_feedforward, dropout=0.1):
+    def __init__(self, d_model, dim_feedforward, grid_size=5, dropout=0.1):
         super().__init__()
-        self.kan1 = ReLUKANLinear(d_model, dim_feedforward)
+        self.kan1 = ReLUKANLinear(d_model, dim_feedforward, grid_size=grid_size)
         self.dropout = nn.Dropout(dropout)
-        self.kan2 = ReLUKANLinear(dim_feedforward, d_model)
+        self.kan2 = ReLUKANLinear(dim_feedforward, d_model, grid_size=grid_size)
 
     def forward(self, x):
         x = self.kan1(x)
@@ -100,7 +102,17 @@ class VectorQuantizer(nn.Module):
 # 4. Scaled KAN-VQ Transformer
 # ==========================================
 class KAN_VQTransformer(nn.Module):
-    def __init__(self, vocab_size, embed_dim=256, num_layers=4, nhead=8, max_seq_len=128, dropout=0.1):
+    def __init__(
+        self,
+        vocab_size,
+        embed_dim=256,
+        num_layers=4,
+        nhead=8,
+        max_seq_len=128,
+        dropout=0.1,
+        grid_size=5,
+        commitment_cost=0.05
+    ):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
         self.pos_embedding = nn.Embedding(max_seq_len, embed_dim)
@@ -108,14 +120,18 @@ class KAN_VQTransformer(nn.Module):
         self.layers = nn.ModuleList([
             nn.ModuleDict({
                 'self_attn': nn.MultiheadAttention(embed_dim, nhead, batch_first=True, dropout=dropout),
-                'mlp': ReLUKANMLP(embed_dim, embed_dim * 4, dropout=dropout),
+                'mlp': ReLUKANMLP(embed_dim, embed_dim * 4, grid_size=grid_size, dropout=dropout),
                 'norm1': nn.LayerNorm(embed_dim),
                 'norm2': nn.LayerNorm(embed_dim),
                 'dropout': nn.Dropout(dropout)
             }) for _ in range(num_layers)
         ])
         
-        self.vq_layer = VectorQuantizer(num_embeddings=vocab_size, embedding_dim=embed_dim)
+        self.vq_layer = VectorQuantizer(
+            num_embeddings=vocab_size,
+            embedding_dim=embed_dim,
+            commitment_cost=commitment_cost
+        )
 
     def forward(self, idx):
         b, s = idx.shape
@@ -139,7 +155,7 @@ class KAN_VQTransformer(nn.Module):
 
 
 # ==========================================
-# 5. Learning Rate Scheduler (Warmup + Cosine)
+# 5. Helpers (Scheduler & Plotting)
 # ==========================================
 def get_lr(step, warmup_steps, max_steps, max_lr, min_lr):
     if step < warmup_steps:
@@ -148,9 +164,6 @@ def get_lr(step, warmup_steps, max_steps, max_lr, min_lr):
     return min_lr + 0.5 * (max_lr - min_lr) * (1.0 + math.cos(math.pi * progress))
 
 
-# ==========================================
-# 6. Metric Plotting Helper
-# ==========================================
 def save_metrics_plot(history_steps, history_loss, history_codes, vocab_size, output_path):
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
 
@@ -173,47 +186,64 @@ def save_metrics_plot(history_steps, history_loss, history_codes, vocab_size, ou
 
 
 # ==========================================
-# 7. Training & Setup
+# 6. Main Pipeline
 # ==========================================
 if __name__ == "__main__":
-    # Scaled Hyperparameters
-    embed_dim = 256
-    num_layers = 4
-    nhead = 8
-    batch_size = 32
-    seq_len = 128
-    vocab_size = 2048
-    max_steps = 10000
-    warmup_steps = 500
-    max_lr = 4e-4
-    min_lr = 4e-5
-    log_interval = 50
+    parser = argparse.ArgumentParser(description="Train KAN-VQ Transformer from config.json")
+    parser.add_argument("--config", type=str, default="config.json", help="Path to config.json")
+    args = parser.parse_args()
 
-    save_dir = "./kan_vq_scaled_checkpoints"
+    with open(args.config, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    # Unpack config namespaces
+    m_cfg = cfg["model"]
+    d_cfg = cfg["data"]
+    t_cfg = cfg["training"]
+    p_cfg = cfg["paths"]
+    i_cfg = cfg["inference"]
+
+    save_dir = p_cfg["checkpoint_dir"]
     os.makedirs(save_dir, exist_ok=True)
     tokenizer_file = os.path.join(save_dir, "tokenizer.json")
 
-    print("Loading TinyStories dataset (25% slice)...")
-    try:
-        raw_dataset = load_dataset("roneneldan/TinyStories", split="train[:25%]")
-        dataset_texts = raw_dataset.to_dict()['text']
-        print(f"Loaded {len(dataset_texts):,} stories.")
-    except Exception:
-        dataset_texts = [
-            "Once upon a time, there was a little cat named Lily. Lily loved to play with a red ball."
-        ] * 100
+    # Save active config copy inside checkpoints folder for reproducible inference
+    with open(os.path.join(save_dir, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
 
+    # 1. Dataset Loading
+    print("Loading dataset...")
+    if d_cfg.get("local_data_file"):
+        local_path = d_cfg["local_data_file"]
+        print(f"Reading local dataset from: {local_path}")
+        with open(local_path, "r", encoding="utf-8") as f:
+            dataset_texts = [line.strip() for line in f if line.strip()]
+    else:
+        dataset_name = d_cfg["dataset_name"]
+        dataset_split = d_cfg["dataset_split"]
+        print(f"Loading '{dataset_name}' ({dataset_split})...")
+        try:
+            raw_dataset = load_dataset(dataset_name, split=dataset_split)
+            dataset_texts = raw_dataset.to_dict()['text']
+        except Exception as e:
+            print(f"Dataset load failed ({e}), falling back to dummy corpus...")
+            dataset_texts = [
+                "Once upon a time, there was a little cat named Lily. Lily loved to play with a red ball."
+            ] * 100
+    print(f"Loaded {len(dataset_texts):,} text samples.")
+
+    # 2. Tokenizer Setup
     if os.path.exists(tokenizer_file):
         print(f"Loading cached tokenizer from: {tokenizer_file}")
         raw_tokenizer = Tokenizer.from_file(tokenizer_file)
     else:
-        print(f"Training custom BPE tokenizer with vocab size {vocab_size}...")
+        print(f"Training custom BPE tokenizer (vocab_size={m_cfg['vocab_size']})...")
         raw_tokenizer = Tokenizer(BPE(unk_token="<unk>"))
         raw_tokenizer.pre_tokenizer = ByteLevel()
         raw_tokenizer.decoder = ByteLevelDecoder()
 
         trainer = BpeTrainer(
-            vocab_size=vocab_size, 
+            vocab_size=m_cfg["vocab_size"],
             special_tokens=["<unk>", "<pad>", "<s>", "</s>"]
         )
         raw_tokenizer.train_from_iterator(dataset_texts, trainer)
@@ -222,6 +252,10 @@ if __name__ == "__main__":
 
     tokenizer = PreTrainedTokenizerFast(tokenizer_object=raw_tokenizer)
     tokenizer.pad_token = "<pad>"
+
+    # 3. Data Batching
+    seq_len = m_cfg["max_seq_len"]
+    batch_size = t_cfg["batch_size"]
 
     def get_batch():
         batch_texts = [random.choice(dataset_texts) for _ in range(batch_size)]
@@ -237,35 +271,43 @@ if __name__ == "__main__":
         data_tensor = torch.tensor(encoded_batches, dtype=torch.long)
         return data_tensor[:, :-1], data_tensor[:, 1:]
 
+    # 4. Model & Optimizer Initialization
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training Scaled KAN-VQ Transformer on device: {device}")
+    print(f"Training on device: {device}")
 
     model = KAN_VQTransformer(
-        vocab_size=vocab_size, 
-        embed_dim=embed_dim, 
-        num_layers=num_layers, 
-        nhead=nhead, 
-        max_seq_len=seq_len
+        vocab_size=m_cfg["vocab_size"],
+        embed_dim=m_cfg["embed_dim"],
+        num_layers=m_cfg["num_layers"],
+        nhead=m_cfg["nhead"],
+        max_seq_len=m_cfg["max_seq_len"],
+        dropout=m_cfg["dropout"],
+        grid_size=m_cfg["grid_size"],
+        commitment_cost=m_cfg["commitment_cost"]
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable parameters: {total_params:,}")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=max_lr, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=t_cfg["max_lr"],
+        weight_decay=t_cfg["weight_decay"]
+    )
 
+    # 5. Training Loop
     history_steps = []
     history_loss = []
     history_codes = []
 
-    print(f"\nStarting training loop for {max_steps} steps...\n")
+    print(f"\nStarting training loop for {t_cfg['max_steps']} steps...\n")
     print(f"{'Step':<7} | {'LR':<9} | {'Loss':<10} | {'Batch Codes':<12}")
     print("-" * 46)
 
     best_loss = float('inf')
 
-    for step in range(1, max_steps + 1):
-        # Update learning rate
-        lr = get_lr(step, warmup_steps, max_steps, max_lr, min_lr)
+    for step in range(1, t_cfg["max_steps"] + 1):
+        lr = get_lr(step, t_cfg["warmup_steps"], t_cfg["max_steps"], t_cfg["max_lr"], t_cfg["min_lr"])
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
@@ -277,7 +319,7 @@ if __name__ == "__main__":
 
         quantized_out, vq_loss, code_indices, distances, raw_out = model(x_batch)
         
-        flat_out = F.normalize(raw_out.reshape(-1, embed_dim), p=2, dim=-1)
+        flat_out = F.normalize(raw_out.reshape(-1, m_cfg["embed_dim"]), p=2, dim=-1)
         norm_weights = F.normalize(model.vq_layer.embedding.weight, p=2, dim=-1)
         logits = torch.matmul(flat_out, norm_weights.t()) * 16.0
         
@@ -285,13 +327,14 @@ if __name__ == "__main__":
         total_loss = ce_loss + vq_loss
 
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        if t_cfg.get("grad_clip", 0.0) > 0.0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=t_cfg["grad_clip"])
         optimizer.step()
 
         current_loss = total_loss.item()
         unique_codes = torch.unique(code_indices).numel()
 
-        if step == 1 or step % log_interval == 0:
+        if step == 1 or step % t_cfg["log_interval"] == 0:
             history_steps.append(step)
             history_loss.append(current_loss)
             history_codes.append(unique_codes)
@@ -303,27 +346,21 @@ if __name__ == "__main__":
         if step == 1 or step % 500 == 0:
             print(f"{step:<7} | {lr:<9.2e} | {current_loss:<10.4f} | {unique_codes:<4} in batch")
 
-    # Save final checkpoint
+    # 6. Save Checkpoints & Plot
     torch.save({
-        'step': max_steps,
+        'step': t_cfg["max_steps"],
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'loss': current_loss,
-        'vocab_size': vocab_size,
-        'embed_dim': embed_dim,
-        'num_layers': num_layers,
-        'nhead': nhead,
-        'seq_len': seq_len
+        'config': cfg
     }, os.path.join(save_dir, "last_checkpoint.pt"))
 
     print(f"\nTraining complete. Lowest loss: {best_loss:.4f}")
     plot_path = os.path.join(save_dir, "metrics_over_iterations.png")
-    save_metrics_plot(history_steps, history_loss, history_codes, vocab_size, plot_path)
+    save_metrics_plot(history_steps, history_loss, history_codes, m_cfg["vocab_size"], plot_path)
     print(f"Metrics plot saved to: {plot_path}")
 
-    # ==========================================
-    # 8. Generation Test
-    # ==========================================
+    # 7. Verification Generation
     print("\n" + "="*45)
     print(" SCALED KAN-VQ GENERATION TEST")
     print("="*45)
@@ -332,11 +369,11 @@ if __name__ == "__main__":
     model.eval()
 
     @torch.no_grad()
-    def generate(prompt_str, max_new_tokens=60, temperature=0.7, top_k=30, top_p=0.9):
+    def generate(prompt_str):
         input_ids = tokenizer.encode(prompt_str)
         idx = torch.tensor([input_ids], dtype=torch.long, device=device)
 
-        for _ in range(max_new_tokens):
+        for _ in range(i_cfg["max_new_tokens"]):
             idx_cond = idx[:, -seq_len:]
             _, _, _, _, raw_out = model(idx_cond)
             
@@ -344,20 +381,19 @@ if __name__ == "__main__":
             norm_weights = F.normalize(model.vq_layer.embedding.weight, p=2, dim=-1)
             next_token_logits = (torch.matmul(flat_out, norm_weights.t()) * 16.0).squeeze(1)
 
-            # Repetition penalty
             for token_id in set(idx[0].tolist()):
-                next_token_logits[0, token_id] /= 1.25
+                next_token_logits[0, token_id] /= i_cfg["repetition_penalty"]
 
-            next_token_logits = next_token_logits / max(temperature, 1e-5)
+            next_token_logits = next_token_logits / max(i_cfg["temperature"], 1e-5)
 
-            if top_k is not None:
-                v, _ = torch.topk(next_token_logits, min(top_k, next_token_logits.size(-1)))
+            if i_cfg.get("top_k"):
+                v, _ = torch.topk(next_token_logits, min(i_cfg["top_k"], next_token_logits.size(-1)))
                 next_token_logits[next_token_logits < v[:, [-1]]] = -float('Inf')
 
-            if top_p is not None:
+            if i_cfg.get("top_p") and 0.0 < i_cfg["top_p"] < 1.0:
                 sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
                 cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove = cumulative_probs > i_cfg["top_p"]
                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                 sorted_indices_to_remove[..., 0] = False
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)

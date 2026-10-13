@@ -1,4 +1,6 @@
 import os
+import json
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,7 +8,7 @@ from tokenizers import Tokenizer
 from transformers import PreTrainedTokenizerFast
 
 # ==========================================
-# 1. Model Definitions (Matching Scaled Architecture)
+# 1. Model Definitions
 # ==========================================
 class ReLUKANLinear(nn.Module):
     def __init__(self, in_features, out_features, grid_size=5):
@@ -31,11 +33,11 @@ class ReLUKANLinear(nn.Module):
 
 
 class ReLUKANMLP(nn.Module):
-    def __init__(self, d_model, dim_feedforward, dropout=0.1):
+    def __init__(self, d_model, dim_feedforward, grid_size=5, dropout=0.1):
         super().__init__()
-        self.kan1 = ReLUKANLinear(d_model, dim_feedforward)
+        self.kan1 = ReLUKANLinear(d_model, dim_feedforward, grid_size=grid_size)
         self.dropout = nn.Dropout(dropout)
-        self.kan2 = ReLUKANLinear(dim_feedforward, d_model)
+        self.kan2 = ReLUKANLinear(dim_feedforward, d_model, grid_size=grid_size)
 
     def forward(self, x):
         x = self.kan1(x)
@@ -64,7 +66,17 @@ class VectorQuantizer(nn.Module):
 
 
 class KAN_VQTransformer(nn.Module):
-    def __init__(self, vocab_size, embed_dim=256, num_layers=4, nhead=8, max_seq_len=128, dropout=0.1):
+    def __init__(
+        self,
+        vocab_size,
+        embed_dim=256,
+        num_layers=4,
+        nhead=8,
+        max_seq_len=128,
+        dropout=0.1,
+        grid_size=5,
+        commitment_cost=0.05
+    ):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
         self.pos_embedding = nn.Embedding(max_seq_len, embed_dim)
@@ -72,7 +84,7 @@ class KAN_VQTransformer(nn.Module):
         self.layers = nn.ModuleList([
             nn.ModuleDict({
                 'self_attn': nn.MultiheadAttention(embed_dim, nhead, batch_first=True, dropout=dropout),
-                'mlp': ReLUKANMLP(embed_dim, embed_dim * 4, dropout=dropout),
+                'mlp': ReLUKANMLP(embed_dim, embed_dim * 4, grid_size=grid_size, dropout=dropout),
                 'norm1': nn.LayerNorm(embed_dim),
                 'norm2': nn.LayerNorm(embed_dim),
                 'dropout': nn.Dropout(dropout)
@@ -133,7 +145,6 @@ def generate(
         norm_weights = F.normalize(model.vq_layer.embedding.weight, p=2, dim=-1)
         next_token_logits = (torch.matmul(flat_out, norm_weights.t()) * 16.0).squeeze(1)
 
-        # Repetition penalty
         for token_id in set(idx[0].tolist()):
             next_token_logits[0, token_id] /= repetition_penalty
 
@@ -165,7 +176,18 @@ def generate(
 # 3. Interactive CLI Runner
 # ==========================================
 if __name__ == "__main__":
-    checkpoints_dir = "./kan_vq_scaled_checkpoints"
+    parser = argparse.ArgumentParser(description="Interactive generation from config.json")
+    parser.add_argument("--config", type=str, default="config.json", help="Path to config.json")
+    args = parser.parse_args()
+
+    with open(args.config, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    m_cfg = cfg["model"]
+    p_cfg = cfg["paths"]
+    i_cfg = cfg["inference"]
+
+    checkpoints_dir = p_cfg["checkpoint_dir"]
     tokenizer_path = os.path.join(checkpoints_dir, "tokenizer.json")
     model_path = os.path.join(checkpoints_dir, "best_model.pt")
 
@@ -181,19 +203,15 @@ if __name__ == "__main__":
     tokenizer = PreTrainedTokenizerFast(tokenizer_object=raw_tokenizer)
     tokenizer.pad_token = "<pad>"
 
-    # Scaled configuration matching checkpoint
-    vocab_size = 2048
-    embed_dim = 256
-    num_layers = 4
-    nhead = 8
-    seq_len = 128
-
     model = KAN_VQTransformer(
-        vocab_size=vocab_size,
-        embed_dim=embed_dim,
-        num_layers=num_layers,
-        nhead=nhead,
-        max_seq_len=seq_len
+        vocab_size=m_cfg["vocab_size"],
+        embed_dim=m_cfg["embed_dim"],
+        num_layers=m_cfg["num_layers"],
+        nhead=m_cfg["nhead"],
+        max_seq_len=m_cfg["max_seq_len"],
+        dropout=m_cfg["dropout"],
+        grid_size=m_cfg["grid_size"],
+        commitment_cost=m_cfg["commitment_cost"]
     ).to(device)
 
     model.load_state_dict(torch.load(model_path, map_location=device))
@@ -213,11 +231,11 @@ if __name__ == "__main__":
                 model=model,
                 tokenizer=tokenizer,
                 prompt=prompt,
-                max_new_tokens=80,
-                temperature=0.7,
-                top_k=30,
-                top_p=0.9,
-                repetition_penalty=1.25,
+                max_new_tokens=i_cfg["max_new_tokens"],
+                temperature=i_cfg["temperature"],
+                top_k=i_cfg["top_k"],
+                top_p=i_cfg["top_p"],
+                repetition_penalty=i_cfg["repetition_penalty"],
                 device=device
             )
 
